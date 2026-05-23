@@ -59,6 +59,11 @@ FUNCTION_CALL_ATTRIBUTE = "function_call"
 
 _SYNC_ITER_EXHAUSTED = object()
 
+# Frozen set of all field names in GenericStreamingChunk TypedDict.
+# Built once at import time so generic_chunk_has_all_required_fields()
+# avoids re-reading __annotations__ on every chunk.
+_GCHUNK_FIELDS: frozenset = frozenset(GChunk.__annotations__)
+
 
 def _next_sync_or_exhausted(it: Any) -> Any:
     """
@@ -180,6 +185,36 @@ class CustomStreamWrapper:
         self.is_function_call = self.check_is_function_call(logging_obj=logging_obj)
         self.created: Optional[int] = None
         self._last_returned_hidden_params: Optional[dict] = None
+
+        # --- per-request caches to eliminate repeated work on every chunk ---
+
+        # Pre-compute the effective model name (accounting for the openai/azure
+        # provider prefix that model_response_creator injects).
+        _cached_logging_provider = self.logging_obj.model_call_details.get(
+            "custom_llm_provider", None
+        )
+        self._cached_logging_llm_provider: Optional[str] = _cached_logging_provider
+        _effective_model = model or ""
+        if (
+            custom_llm_provider == "openai"
+            and custom_llm_provider != _cached_logging_provider
+        ):
+            _effective_model = "{}/{}".format(
+                _cached_logging_provider, _effective_model
+            )
+        self._cached_model_name: str = _effective_model
+
+        # Pre-compute the static portion of _hidden_params so model_response_creator
+        # can build the per-chunk dict with a single spread instead of two.
+        self._base_hidden_params: Dict[str, Any] = {
+            **self._hidden_params,
+            "response_cost": None,
+        }
+
+        # Lazily populated list of callbacks that implement
+        # async_post_call_streaming_deployment_hook.  Resolved once on the
+        # first call and reused for the lifetime of the stream.
+        self._post_streaming_hooks: Optional[List] = None
 
     def _check_max_streaming_duration(self) -> None:
         """Raise litellm.Timeout if the stream has exceeded LITELLM_MAX_STREAMING_DURATION_SECONDS."""
@@ -681,29 +716,19 @@ class CustomStreamWrapper:
     def model_response_creator(
         self, chunk: Optional[dict] = None, hidden_params: Optional[dict] = None
     ):
-        _model = self.model
-        _received_llm_provider = self.custom_llm_provider
-        _logging_obj_llm_provider = self.logging_obj.model_call_details.get("custom_llm_provider", None)  # type: ignore
-        if (
-            _received_llm_provider == "openai"
-            and _received_llm_provider != _logging_obj_llm_provider
-        ):
-            _model = "{}/{}".format(_logging_obj_llm_provider, _model)
+        # Use pre-computed model name and provider (set at __init__) to avoid
+        # a dict lookup + conditional string format on every chunk.
+        _model = self._cached_model_name
+        _logging_obj_llm_provider = self._cached_logging_llm_provider
+
         if chunk is None:
-            chunk = {}
+            args: Dict[str, Any] = {"model": _model}
         else:
             # pop model keyword
             chunk.pop("model", None)
-
-        chunk_dict = {}
-        for key, value in chunk.items():
-            if key != "stream":
-                chunk_dict[key] = value
-
-        args = {
-            "model": _model,
-            **chunk_dict,
-        }
+            args = {"model": _model}
+            if chunk:
+                args.update({k: v for k, v in chunk.items() if k != "stream"})
 
         model_response = ModelResponseStream(**args)
         if self.response_id is not None:
@@ -717,15 +742,24 @@ class CustomStreamWrapper:
             model_response.created = self.created
         else:
             self.created = model_response.created
+
+        # Build hidden_params in a single dict spread instead of two separate
+        # assignments followed by a second spread.  _base_hidden_params is
+        # pre-computed at __init__ and contains self._hidden_params merged
+        # with {"response_cost": None}.
         if hidden_params is not None:
-            model_response._hidden_params = hidden_params
-        model_response._hidden_params["custom_llm_provider"] = _logging_obj_llm_provider
-        model_response._hidden_params["created_at"] = time.time()
-        model_response._hidden_params = {
-            **model_response._hidden_params,
-            **self._hidden_params,
-            "response_cost": None,
-        }
+            model_response._hidden_params = {
+                "custom_llm_provider": _logging_obj_llm_provider,
+                "created_at": time.time(),
+                **hidden_params,
+                **self._base_hidden_params,
+            }
+        else:
+            model_response._hidden_params = {
+                "custom_llm_provider": _logging_obj_llm_provider,
+                "created_at": time.time(),
+                **self._base_hidden_params,
+            }
 
         if (
             len(model_response.choices) > 0
@@ -1627,6 +1661,19 @@ class CustomStreamWrapper:
             from litellm.integrations.custom_logger import CustomLogger
             from litellm.types.utils import CallTypes
 
+            # Resolve and cache the set of callbacks that have this hook once
+            # per stream (self._post_streaming_hooks is None until first call).
+            if self._post_streaming_hooks is None:
+                self._post_streaming_hooks = [
+                    cb
+                    for cb in litellm.callbacks
+                    if isinstance(cb, CustomLogger)
+                    and hasattr(cb, "async_post_call_streaming_deployment_hook")
+                ]
+
+            if not self._post_streaming_hooks:
+                return chunk
+
             # Get request kwargs from logging object
             request_data = self.logging_obj.model_call_details
             call_type_str = self.logging_obj.call_type
@@ -1636,18 +1683,14 @@ class CustomStreamWrapper:
             except ValueError:
                 typed_call_type = None
 
-            # Call hooks for all callbacks
-            for callback in litellm.callbacks:
-                if isinstance(callback, CustomLogger) and hasattr(
-                    callback, "async_post_call_streaming_deployment_hook"
-                ):
-                    result = await callback.async_post_call_streaming_deployment_hook(
-                        request_data=request_data,
-                        response_chunk=chunk,
-                        call_type=typed_call_type,
-                    )
-                    if result is not None:
-                        chunk = result
+            for callback in self._post_streaming_hooks:
+                result = await callback.async_post_call_streaming_deployment_hook(
+                    request_data=request_data,
+                    response_chunk=chunk,
+                    call_type=typed_call_type,
+                )
+                if result is not None:
+                    chunk = result
 
             return chunk
         except Exception as e:
@@ -1888,9 +1931,12 @@ class CustomStreamWrapper:
                         response = self._add_mcp_list_tools_to_first_chunk(response)
                         self.sent_first_chunk = True
 
-                    if hasattr(
-                        response, "usage"
-                    ):  # remove usage from chunk, only send on final chunk
+                    # Only pay the model_dump + recreate cost when the chunk
+                    # actually carries usage data (rare — typically only the
+                    # final usage-reporting chunk).  ModelResponseStream always
+                    # has a `usage` attribute, so hasattr() is always True and
+                    # would trigger the expensive path on *every* chunk.
+                    if getattr(response, "usage", None) is not None:
                         # Convert the object to a dictionary
                         obj_dict = response.model_dump()
 
@@ -2398,10 +2444,9 @@ def generic_chunk_has_all_required_fields(chunk: dict) -> bool:
     :param chunk: The dictionary to check.
     :return: True if all required fields are present, False otherwise.
     """
-    _all_fields = GChunk.__annotations__
-
-    decision = all(key in _all_fields for key in chunk)
-    return decision
+    # Use the module-level frozenset (_GCHUNK_FIELDS) instead of re-reading
+    # GChunk.__annotations__ on every invocation.
+    return all(key in _GCHUNK_FIELDS for key in chunk)
 
 
 def convert_generic_chunk_to_model_response_stream(
