@@ -747,11 +747,17 @@ class CustomStreamWrapper:
         # assignments followed by a second spread.  _base_hidden_params is
         # pre-computed at __init__ and contains self._hidden_params merged
         # with {"response_cost": None}.
+        #
+        # Spread order (last writer wins):
+        #   1. hidden_params    — caller-supplied values (lowest priority)
+        #   2. custom_llm_provider / created_at — always use our computed values
+        #   3. _base_hidden_params (model_id, api_base, etc.) — highest priority,
+        #      matching the original where self._hidden_params came last.
         if hidden_params is not None:
             model_response._hidden_params = {
+                **hidden_params,
                 "custom_llm_provider": _logging_obj_llm_provider,
                 "created_at": time.time(),
-                **hidden_params,
                 **self._base_hidden_params,
             }
         else:
