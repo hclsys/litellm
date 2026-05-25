@@ -206,6 +206,9 @@ class CustomStreamWrapper:
 
         # Pre-compute the static portion of _hidden_params so model_response_creator
         # can build the per-chunk dict with a single spread instead of two.
+        # INVARIANT: self._hidden_params is populated from litellm_params at init and
+        # never mutated during the stream, so this snapshot stays fresh for the full
+        # lifetime of the wrapper.  If that ever changes this cache must be removed.
         self._base_hidden_params: Dict[str, Any] = {
             **self._hidden_params,
             "response_cost": None,
