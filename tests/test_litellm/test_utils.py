@@ -4143,3 +4143,40 @@ class TestValidateAndFixThinkingParam:
         validate_and_fix_thinking_param(thinking=thinking)
         assert "budgetTokens" in thinking
         assert "budget_tokens" not in thinking
+
+
+class TestStreamOptionsNonStreaming:
+    """stream_options is only valid for streaming requests; OpenAI-compatible
+    backends (e.g. vLLM) 400 if it's sent without stream=True. See #29431."""
+
+    def test_stream_options_dropped_when_stream_not_set(self):
+        from litellm.utils import get_optional_params
+
+        result = get_optional_params(
+            model="my-model",
+            custom_llm_provider="openai",
+            stream_options={"include_usage": True},
+        )
+        assert "stream_options" not in result
+
+    def test_stream_options_dropped_when_stream_false(self):
+        from litellm.utils import get_optional_params
+
+        result = get_optional_params(
+            model="my-model",
+            custom_llm_provider="openai",
+            stream=False,
+            stream_options={"include_usage": True},
+        )
+        assert "stream_options" not in result
+
+    def test_stream_options_kept_when_streaming(self):
+        from litellm.utils import get_optional_params
+
+        result = get_optional_params(
+            model="my-model",
+            custom_llm_provider="openai",
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        assert result.get("stream_options") == {"include_usage": True}
