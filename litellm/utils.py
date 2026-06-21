@@ -8915,9 +8915,7 @@ class ProviderConfigManager:
             )
 
             return AzureSpeechAudioTranscriptionConfig()
-        if litellm.LlmProviders.FIREWORKS_AI == provider:
-            return litellm.FireworksAIAudioTranscriptionConfig()
-        elif litellm.LlmProviders.DEEPGRAM == provider:
+        if litellm.LlmProviders.DEEPGRAM == provider:
             return litellm.DeepgramAudioTranscriptionConfig()
         elif litellm.LlmProviders.ELEVENLABS == provider:
             from litellm.llms.elevenlabs.audio_transcription.transformation import (
