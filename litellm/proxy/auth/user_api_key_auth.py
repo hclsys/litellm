@@ -1527,6 +1527,17 @@ async def _user_api_key_auth_builder(
                     api_key
                 )
 
+        # On a cache hit (2nd+ request on a shared virtual key), the cached token
+        # still carries the FIRST request's end_user. Re-apply this request's
+        # end_user_params so spend logs / end-user limits / allowed_model_region
+        # attribute to the correct per-request end-user instead of being pinned to
+        # the first one. The non-cached (DB-fetch) path applies these later; the
+        # PROXY_ADMIN / master-key branches already re-apply on their cached paths.
+        if valid_token is not None and isinstance(valid_token, UserAPIKeyAuth):
+            valid_token = update_valid_token_with_end_user_params(
+                valid_token=valid_token, end_user_params=end_user_params
+            )
+
         if (
             valid_token is not None
             and isinstance(valid_token, UserAPIKeyAuth)

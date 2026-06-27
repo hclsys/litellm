@@ -3987,7 +3987,9 @@ async def test_non_admin_cli_session_token_reaches_production_auth_path(monkeypa
     assert call_kwargs["valid_token_dict"]["user_id"] == "internal-user-1"
     assert call_kwargs["valid_token_dict"]["team_id"] == "team-abc"
     assert call_kwargs["valid_token_dict"]["is_session_token"] is True
-    assert call_kwargs["valid_token_dict"]["user_role"] == LitellmUserRoles.INTERNAL_USER
+    assert (
+        call_kwargs["valid_token_dict"]["user_role"] == LitellmUserRoles.INTERNAL_USER
+    )
     assert result.is_session_token is True
 
 
@@ -4084,3 +4086,95 @@ async def test_auth_path_caches_team_object_under_canonical_team_id_key():
     assert served is not None and served.team_id == team_id
     assert cache.get_cache(key=team_id) is None
     assert cache.get_cache(key=None) is None
+
+
+@pytest.mark.asyncio
+async def test_end_user_reapplied_on_cached_token_shared_key():
+    """
+    Regression test for issue #31441 (regression in v1.87.0): on a shared virtual
+    key, the `end_user` from the OpenAI `user` field was pinned to the FIRST
+    request's value for every later request, because the cached UserAPIKeyAuth was
+    reused without re-applying the current request's end_user_params.
+
+    A 2nd request (user="bob") on a key whose cached token still carries the first
+    request's end_user ("alice") must resolve to "bob".
+    """
+    from fastapi import Request
+    from starlette.datastructures import URL
+
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.auth.user_api_key_auth import _user_api_key_auth_builder
+    from litellm.proxy.proxy_server import hash_token
+
+    api_key = "sk-shared-key"
+    # cached token from the FIRST request — end_user pinned to "alice"
+    cached_token = UserAPIKeyAuth(
+        api_key=api_key,
+        token=hash_token(api_key),
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        team_id=None,
+        end_user_id="alice",
+    )
+
+    mock_cache = AsyncMock()
+    mock_cache.async_get_cache = AsyncMock(return_value=cached_token)
+
+    mock_proxy_logging_obj = MagicMock()
+    mock_proxy_logging_obj.internal_usage_cache = MagicMock()
+    mock_proxy_logging_obj.internal_usage_cache.dual_cache = AsyncMock()
+    mock_proxy_logging_obj.during_call_hook = AsyncMock(return_value=None)
+    mock_proxy_logging_obj.pre_call_hook = AsyncMock(return_value={"user": "bob"})
+
+    with (
+        patch(
+            "litellm.proxy.auth.resolvers.store.IdentityStore._resolve_key",
+            new_callable=AsyncMock,
+            return_value=cached_token,
+        ),
+        patch(
+            "litellm.proxy.auth.user_api_key_auth.get_end_user_object",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+    ):
+        import litellm.proxy.proxy_server as _proxy_server_mod
+
+        _attrs = {
+            "prisma_client": MagicMock(),
+            "user_api_key_cache": mock_cache,
+            "proxy_logging_obj": mock_proxy_logging_obj,
+            "master_key": "sk-master-key",
+            "general_settings": {},
+            "llm_model_list": [],
+            "llm_router": None,
+            "open_telemetry_logger": None,
+            "model_max_budget_limiter": MagicMock(),
+            "user_custom_auth": None,
+            "jwt_handler": None,
+            "litellm_proxy_admin_name": "admin",
+        }
+        _orig = {a: getattr(_proxy_server_mod, a, None) for a in _attrs}
+        try:
+            for a, v in _attrs.items():
+                setattr(_proxy_server_mod, a, v)
+
+            request = Request(scope={"type": "http"})
+            request._url = URL(url="/chat/completions")
+
+            result = await _user_api_key_auth_builder(
+                request=request,
+                api_key=f"Bearer {api_key}",
+                azure_api_key_header="",
+                anthropic_api_key_header=None,
+                google_ai_studio_api_key_header=None,
+                azure_apim_header=None,
+                request_data={"user": "bob"},
+            )
+
+            assert result.end_user_id == "bob", (
+                f"end_user should be re-attributed to this request's user 'bob', "
+                f"not pinned to the cached 'alice'. Got: {result.end_user_id}"
+            )
+        finally:
+            for a, v in _orig.items():
+                setattr(_proxy_server_mod, a, v)
