@@ -550,6 +550,19 @@ class LangFuseLogger:
             # Add default langfuse tags
             tags = self.add_default_langfuse_tags(tags=tags, kwargs=kwargs, metadata=metadata)
 
+            # Newer endpoints (e.g. /v1/responses) pass the caller's trace
+            # metadata nested under `requester_metadata` rather than at the top
+            # level, so the trace-key handling below would miss it and the trace
+            # would land under a generated id. Lift the trace keys up first
+            # (mirrors LangSmith's _build_extra_metadata). See #34226.
+            requester_metadata = clean_metadata.get("requester_metadata")
+            if isinstance(requester_metadata, dict):
+                for _rkey, _rvalue in requester_metadata.items():
+                    if (
+                        _rkey in ("trace_id", "session_id") or _rkey.startswith("trace_")
+                    ) and _rkey not in clean_metadata:
+                        clean_metadata[_rkey] = _rvalue
+
             session_id = clean_metadata.pop("session_id", None)
             trace_name = cast(Optional[str], clean_metadata.pop("trace_name", None))
             trace_id = clean_metadata.pop("trace_id", None)

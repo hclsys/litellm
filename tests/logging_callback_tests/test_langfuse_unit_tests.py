@@ -586,3 +586,50 @@ def test_langfuse_v2_uses_standard_logging_model_parameters():
     assert "api_key" not in fallback_sanitized
     assert "secret_fields" not in fallback_sanitized
     assert fallback_sanitized["temperature"] == 0.5
+
+
+def test_langfuse_v2_lifts_trace_metadata_from_requester_metadata():
+    """Regression for #34226.
+
+    Newer endpoints (e.g. /v1/responses) pass the caller's trace metadata
+    nested under ``requester_metadata`` rather than at the top level. The
+    Langfuse trace must still use the caller's ``trace_id``/``session_id``/
+    ``trace_user_id`` instead of falling back to a generated call id.
+    """
+    from datetime import datetime
+    from unittest.mock import MagicMock
+
+    logger = LangFuseLogger(
+        langfuse_public_key="pk",
+        langfuse_secret="sk",
+        langfuse_host="https://x.langfuse.com",
+    )
+    logger.Langfuse = MagicMock()
+    logger.Langfuse.trace.return_value = MagicMock()
+
+    metadata = {
+        "requester_metadata": {
+            "trace_id": "client-trace-123",
+            "session_id": "client-session",
+            "trace_user_id": "client-user",
+        }
+    }
+    logger._log_langfuse_v2(
+        user_id=None,
+        metadata=metadata,
+        litellm_params={},
+        output="hi",
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+        kwargs={},
+        optional_params={},
+        input={"messages": []},
+        response_obj={},
+        level="DEFAULT",
+        litellm_call_id="fallback-call-id",
+    )
+
+    trace_kwargs = logger.Langfuse.trace.call_args.kwargs
+    assert trace_kwargs["id"] == "client-trace-123"
+    assert trace_kwargs["session_id"] == "client-session"
+    assert trace_kwargs["user_id"] == "client-user"
